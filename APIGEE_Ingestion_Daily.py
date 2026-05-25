@@ -102,10 +102,7 @@ flattened_records = []
 for record in hits:
     flat = {}
     for key, value in record.get("fields", {}).items():
-        # Replace dots in field names (e.g. Scope.keyword → Scope_keyword)
-        # so PySpark treats them as flat columns, not nested structs
-        clean_key = key.replace(".", "_")
-        flat[clean_key] = value[0] if isinstance(value, list) and len(value) > 0 else value
+        flat[key] = value[0] if isinstance(value, list) and len(value) > 0 else value
     flattened_records.append(flat)
 
 rdd = spark.sparkContext.parallelize([json.dumps(r) for r in flattened_records])
@@ -123,7 +120,7 @@ for scope_val, journey in SCOPE_JOURNEY_MAP.items():
     print(f"scope={scope_val}  journey={journey}")
 
     # Filter the already-fetched DataFrame for this scope only
-    journey_df = df.filter(col("Scope_keyword") == scope_val)
+    journey_df = df.filter(col("`Scope.keyword`") == scope_val)
     count = journey_df.count()
     print(f"  Records for this scope : {count}")
 
