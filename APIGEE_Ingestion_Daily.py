@@ -130,27 +130,26 @@ for scope_val, journey in SCOPE_JOURNEY_MAP.items():
         continue
 
     # Resolve ADLS path from metadata config table
-    metadata_df = spark.sql(f"""
-        SELECT *
-        FROM   sindhu_db.prod.ddi_metadata_db.api_config_table
+    metadata_rows = spark.sql(f"""
+        SELECT ADLS_Path
+        FROM   sindhu_db_prod.ddi_metadata_db.api_config_table
         WHERE  Pipeline = 'APIGEE_Ingestion_Daily'
         AND    GroupID  = '{journey}'
-    """)
-    api_metadata = [row.asDict() for row in metadata_df.collect()]
+    """).collect()
 
-    if not api_metadata:
+    if not metadata_rows:
         print(f"  No metadata row found for {journey}. Skipping.")
         job_results.append({"journey": journey, "status": "NO_METADATA"})
         continue
 
-    for item in api_metadata:
-        adls_raw_path = (
-            f"abfss://raw@ddiprodvyapaaradlstd.dfs.core.windows.net"
-            f"/{item['ADLS_Path']}/{batch_id}/"
-        )
-        print(f"  Writing to : {adls_raw_path}")
-        journey_df.write.mode("overwrite").parquet(adls_raw_path)
-        print(f"  Write complete.")
+    adls_path_base = metadata_rows[0]["ADLS_Path"]
+    adls_raw_path  = (
+        f"abfss://raw@ddiprodvyapaaradlstd.dfs.core.windows.net"
+        f"/{adls_path_base}/{batch_id}/"
+    )
+    print(f"  Writing to : {adls_raw_path}")
+    journey_df.write.mode("overwrite").parquet(adls_raw_path)
+    print(f"  Write complete.")
 
     job_results.append({"journey": journey, "status": "SUCCESS", "records": count})
 
