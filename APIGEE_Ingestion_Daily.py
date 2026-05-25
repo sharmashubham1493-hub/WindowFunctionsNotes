@@ -4,17 +4,11 @@
 
 import requests
 import json
-import time
 from datetime import datetime, timedelta
 import pytz
-import uuid
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import lit, current_timestamp, col
-from requests.auth import HTTPBasicAuth
-from io import StringIO
-import pandas as pd
+from pyspark.sql.functions import col
 import urllib3
-import os
 
 # COMMAND ----------
 
@@ -22,20 +16,16 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # COMMAND ----------
 
-# Initialize Spark session
 spark = SparkSession.builder.appName("APIGEE_Ingestion_Daily").getOrCreate()
 
 # COMMAND ----------
 
-# Setup the batch id for this job
 batch_id = int(datetime.now(pytz.timezone("Asia/Kolkata")).strftime('%Y%m%d%H%M%S'))
 print(batch_id)
 
 # COMMAND ----------
 
-# Scope → GroupID (journey) mapping — 5 journeys
-# Each scope key matches the Scope.keyword value in Elasticsearch records
-# Each journey value matches the GroupID in the metadata config table
+# Scope value (in Elasticsearch) → GroupID (in metadata table)
 SCOPE_JOURNEY_MAP = {
     'SWCC': 'apigee-update-swcc-logs',
     'TDCC': 'apigee-update-tdcc-logs',
@@ -52,92 +42,97 @@ pwd  = "apigee@123"
 # COMMAND ----------
 
 kolkata_tz = pytz.timezone("Asia/Kolkata")
-url = "https://10.227.12.188:9201/apigee_updated-*/search"
-
+url     = "https://10.227.12.188:9201/apigee_updated-*/search"
 headers = {
     "Content-Type": "application/vnd.elasticsearch+json; compatible-with=8",
     "Accept":        "application/vnd.elasticsearch+json; compatible-with=8",
 }
 
-file_date = (datetime.now(kolkata_tz).date() - timedelta(days=1)).strftime("%Y-%m-%d")
-print(file_date)
+file_date  = (datetime.now(kolkata_tz).date() - timedelta(days=1)).strftime("%Y-%m-%d")
+all_scopes = list(SCOPE_JOURNEY_MAP.keys())   # ['SWCC','TDCC','PPCC','PBCC','PTCC']
+print(f"file_date  : {file_date}")
+print(f"all_scopes : {all_scopes}")
 
 # COMMAND ----------
+# ── STEP 1 : Single API call for ALL scopes (same as original working query) ──
 
-# ── Main ingestion loop ─────────────────────────────────────────────────────
-# Each iteration: one API call per scope, parse → DataFrame → write to ADLS
-# This guarantees every journey lands its own data at its own ADLS raw path.
+response = requests.post(
+    url,
+    headers=headers,
+    auth=(user, pwd),
+    json={
+        "size": 10000,
+        "fields": ["*"],
+        "query": {
+            "bool": {
+                "must": [
+                    {
+                        "range": {
+                            "@timestamp": {
+                                "gte": f"{file_date}T00:00:00",
+                                "lte": f"{file_date}T23:59:59",
+                            }
+                        }
+                    },
+                    {"terms": {"Scope.keyword": all_scopes}},
+                ]
+            }
+        },
+    },
+    verify=False,
+    timeout=120,
+)
+
+print(f"HTTP status : {response.status_code}")
+
+if response.status_code != 200:
+    raise Exception(f"API call failed: {response.text[:500]}")
+
+# COMMAND ----------
+# ── STEP 2 : Parse and flatten ALL hits ──────────────────────────────────────
+
+response_json = response.json()
+hits = response_json.get("hits", {}).get("hits", [])
+print(f"Total records fetched : {len(hits)}")
+
+if not hits:
+    raise Exception(f"No records returned for date={file_date}. Check the date or source data.")
+
+flattened_records = []
+for record in hits:
+    flat = {}
+    for key, value in record.get("fields", {}).items():
+        # Replace dots in field names (e.g. Scope.keyword → Scope_keyword)
+        # so PySpark treats them as flat columns, not nested structs
+        clean_key = key.replace(".", "_")
+        flat[clean_key] = value[0] if isinstance(value, list) and len(value) > 0 else value
+    flattened_records.append(flat)
+
+rdd = spark.sparkContext.parallelize([json.dumps(r) for r in flattened_records])
+df  = spark.read.options(mergeSchema=True).json(rdd)
+df.cache()
+print(f"DataFrame : {df.count()} rows  x  {len(df.columns)} columns")
+
+# COMMAND ----------
+# ── STEP 3 : Write each journey's slice to its own ADLS raw path ─────────────
 
 job_results = []
 
 for scope_val, journey in SCOPE_JOURNEY_MAP.items():
     print(f"\n{'='*60}")
-    print(f"Processing scope={scope_val}  journey={journey}")
+    print(f"scope={scope_val}  journey={journey}")
 
-    # ── 1. Fetch data from Elasticsearch for this scope only ──────────────
-    try:
-        response = requests.post(
-            url,
-            headers=headers,
-            auth=(user, pwd),
-            json={
-                "size": 10000,
-                "fields": ["*"],
-                "_source": False,
-                "query": {
-                    "bool": {
-                        "must": [
-                            {
-                                "range": {
-                                    "@timestamp": {
-                                        "gte": f"{file_date}T00:00:00",
-                                        "lte": f"{file_date}T23:59:59",
-                                    }
-                                }
-                            },
-                            {"terms": {"Scope.keyword": [scope_val]}},
-                        ]
-                    }
-                },
-            },
-            verify=False,
-            timeout=120,
-        )
-        print(f"  HTTP status : {response.status_code}")
-    except Exception as e:
-        print(f"  API call failed for {journey}: {e}")
-        job_results.append({"journey": journey, "status": "API_ERROR", "error": str(e)})
-        continue
+    # Filter the already-fetched DataFrame for this scope only
+    journey_df = df.filter(col("Scope_keyword") == scope_val)
+    count = journey_df.count()
+    print(f"  Records for this scope : {count}")
 
-    if response.status_code != 200:
-        print(f"  Non-200 response for {journey}: {response.text[:500]}")
-        job_results.append({"journey": journey, "status": f"HTTP_{response.status_code}"})
-        continue
-
-    # ── 2. Parse and flatten Elasticsearch hits ───────────────────────────
-    response_json = response.json()
-    hits = response_json.get("hits", {}).get("hits", [])
-    print(f"  Records found: {len(hits)}")
-
-    if not hits:
+    if count == 0:
         print(f"  No data for {journey} on {file_date}. Skipping.")
         job_results.append({"journey": journey, "status": "NO_DATA"})
         continue
 
-    flattened_records = []
-    for record in hits:
-        flat = {}
-        for key, value in record.get("fields", {}).items():
-            # Elasticsearch returns every field as a list; unwrap single-value lists
-            flat[key] = value[0] if isinstance(value, list) and len(value) > 0 else value
-        flattened_records.append(flat)
-
-    # ── 3. Build Spark DataFrame ──────────────────────────────────────────
-    rdd = spark.sparkContext.parallelize([json.dumps(r) for r in flattened_records])
-    df  = spark.read.options(mergeSchema=True).json(rdd)
-    print(f"  DataFrame shape: {df.count()} rows × {len(df.columns)} columns")
-
-    # ── 4. Resolve ADLS raw path from the metadata config table ──────────
+    # Resolve ADLS path from metadata config table
     metadata_df = spark.sql(f"""
         SELECT *
         FROM   sindhu_db.prod.ddi_metadata_db.api_config_table
@@ -147,28 +142,24 @@ for scope_val, journey in SCOPE_JOURNEY_MAP.items():
     api_metadata = [row.asDict() for row in metadata_df.collect()]
 
     if not api_metadata:
-        print(f"  No metadata config found for journey={journey}. Skipping write.")
+        print(f"  No metadata row found for {journey}. Skipping.")
         job_results.append({"journey": journey, "status": "NO_METADATA"})
         continue
 
-    # ── 5. Write to every configured ADLS path for this journey ──────────
-    for item in api_metadata:                          # iterate the list, NOT .items()
+    for item in api_metadata:
         adls_raw_path = (
             f"abfss://raw@ddiprodvyapaaradlstd.dfs.core.windows.net"
             f"/{item['ADLS_Path']}/{batch_id}/"
         )
-        print(f"  Writing to: {adls_raw_path}")
-        df.write.mode("overwrite").parquet(adls_raw_path)
-        print(f"  Write complete for {journey}.")
+        print(f"  Writing to : {adls_raw_path}")
+        journey_df.write.mode("overwrite").parquet(adls_raw_path)
+        print(f"  Write complete.")
 
-    job_results.append({"journey": journey, "status": "SUCCESS", "records": len(hits)})
+    job_results.append({"journey": journey, "status": "SUCCESS", "records": count})
 
 # COMMAND ----------
-
 # ── Summary ───────────────────────────────────────────────────────────────────
-print("\nAPGEE ingestion completed for all journeys\n")
+
+print("\nAPIGEE ingestion finished\n")
 for r in job_results:
-    status  = r["status"]
-    journey = r["journey"]
-    records = r.get("records", "-")
-    print(f"  {status:<15} journey={journey}  records={records}")
+    print(f"  {r['status']:<15}  journey={r['journey']}  records={r.get('records','-')}")
