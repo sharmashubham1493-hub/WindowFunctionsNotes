@@ -6,14 +6,10 @@ import requests
 import json
 from datetime import datetime, timedelta
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import lit, current_timestamp, col
-import time
-import boto3
+from pyspark.sql import functions as F
+from pyspark.sql.types import StringType
 import urllib3
 from pytz import timezone
-import re
-import os
-import pandas as pd
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -42,6 +38,81 @@ SCOPE_JOURNEY_MAP = {
 
 # COMMAND ----------
 
+# MASTER_COLUMNS must be defined HERE (before the ES query) so we can pass
+# it as "_source" to Elasticsearch — this is the biggest performance fix:
+# ES will return ONLY these 61 fields per doc instead of the full _source
+# (which includes large request/response body text and other heavy fields).
+# *** Verify these names match exactly what is stored in your ES index. ***
+
+MASTER_COLUMNS = [
+    "@timestamp",
+    "@ProxyType",
+    "Apigee-developer-app.name.keyword",
+    "Apigee-product-name.keyword",
+    "BackendContentType.keyword",
+    "BackendErrorMessage",
+    "BackendErrorMessage.keyword",
+    "BackendFrontMessage.keyword",
+    "ClientIP",
+    "Criticality",
+    "Criticality.keyword",
+    "Environment.name",
+    "GatewayErrorCode",
+    "GatewayErrorCode.keyword",
+    "GatewayErrorMessage",
+    "GatewayErrorMessage.keyword",
+    "GatewayFrontMessage",
+    "GatewayFrontMessage.keyword",
+    "host",
+    "host.keyword",
+    "Mock",
+    "Mock.keyword",
+    "platform",
+    "Platform.keyword",
+    "Proxy.basepath",
+    "Proxy.basepath.keyword",
+    "Proxy.pathsuffix",
+    "Proxy.pathsuffix.keyword",
+    "RequestContentType.keyword",
+    "RequestFilingLogs",
+    "RoutingStatusCode",
+    "RoutingStatusCode.keyword",
+    "Scope",
+    "scope",
+    "ServiceVirtualization.keyword",
+    "Transaction_id",
+    "apigee-index.keyword",
+    "appgronymname.keyword",
+    "micronym",
+    "client.received.start.timestamp",
+    "client.sent.end.timestamp",
+    "target.received.end.timestamp",
+    "target.sent.start.timestamp",
+    "req-journeyID",
+    "req-journeyID.keyword",
+    "req-responseCode",
+    "req-responseCode.keyword",
+    "response",
+    "response.keyword",
+    "RequestStatusCode",
+    "RequestStatusCode.keyword",
+    "BackendStatusCode",
+    "BackendStatusCode.keyword",
+    "RoutingStatus",
+    "RoutingStatus.keyword",
+    "Environment",
+    "Environment.keyword",
+    "apiproxymame",
+    "apiproxymame.keyword",
+    "ClientID",
+    "ClientID.keyword",
+    "apiproduct",
+]
+# ^^^ If your notebook already has a MASTER_COLUMNS list, replace the above
+#     with that exact list and delete any duplicates.
+
+# COMMAND ----------
+
 # Credentials and endpoint
 user = dbutils.secrets.get(scope="apigee_obj", key="user")
 pwd  = dbutils.secrets.get(scope="apigee_obj", key="pwd")
@@ -63,16 +134,22 @@ headers = {
 }
 
 # ---------------------------------------------------------------------------
-# search_after pagination to retrieve ALL records beyond the 10k ES limit.
+# Performance fixes (in order of impact):
 #
-# Performance fixes vs. previous version:
-#   1. Tiebreaker changed from "_id" -> "_shard_doc"
-#      _id sort forces expensive field-data loading for every doc.
-#      _shard_doc is a built-in ES 7.12+ tiebreaker with zero overhead.
-#   2. Query clauses moved to "filter" context (was "must").
-#      filter skips relevance scoring and enables shard-level caching.
-#   3. "track_total_hits": false — stops ES counting every matching doc
-#      per page, which was adding significant overhead for large indices.
+#   1. "_source": MASTER_COLUMNS  <-- BIGGEST FIX for the 1-hour timeout
+#      API gateway logs store full request/response bodies in _source.
+#      30k docs x ~50KB body = ~1.5 GB of data we were fetching but
+#      never using.  Now ES returns only the 61 columns we actually need.
+#
+#   2. "_shard_doc" tiebreaker (was "_id")
+#      _id sort loads field-data for every doc — very expensive.
+#      _shard_doc is a zero-cost built-in tiebreaker (ES 7.12+).
+#
+#   3. "filter" context (was "must")
+#      Skips relevance scoring + enables shard-level query caching.
+#
+#   4. "track_total_hits": false
+#      Stops ES counting every matching doc on each page request.
 # ---------------------------------------------------------------------------
 
 PAGE_SIZE    = 10000
@@ -83,6 +160,7 @@ while True:
     query_body = {
         "size": PAGE_SIZE,
         "track_total_hits": False,
+        "_source": MASTER_COLUMNS,          # <-- only fetch the 61 needed fields
         "sort": [
             {"@timestamp": {"order": "asc"}},
             {"_shard_doc":  "asc"},
@@ -131,7 +209,6 @@ while True:
     if len(hits) < PAGE_SIZE:
         break
 
-    # Advance the cursor to the sort values of the last hit
     search_after = hits[-1]["sort"]
 
 print(f"Total records fetched across all pages: {len(all_hits)}")
@@ -147,4 +224,16 @@ rdd = spark.sparkContext.parallelize(source_records)
 df  = spark.read.json(rdd)
 
 print(f"DataFrame row count: {df.count()}")
+
+# COMMAND ----------
+
+# Align DataFrame to MASTER_COLUMNS — fill any missing cols with null
+existing_cols = set(df.columns)
+df = df.select([
+    F.col(c) if c in existing_cols else F.lit(None).cast(StringType()).alias(c)
+    for c in MASTER_COLUMNS
+])
+
+print(f"Source columns : {len(df.columns)}")
+print(f"Missing columns: {[c for c in MASTER_COLUMNS if c not in existing_cols]}")
 display(df)
