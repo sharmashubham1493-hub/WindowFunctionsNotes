@@ -63,26 +63,33 @@ headers = {
 }
 
 # ---------------------------------------------------------------------------
-# FIX: use search_after pagination to retrieve ALL records.
-# The previous "size": 10000 hard-cap silently truncated results to 10 k rows.
-# Elasticsearch's search_after requires a stable sort; we sort by timestamp +
-# _id so that every page starts exactly where the previous one ended.
+# search_after pagination to retrieve ALL records beyond the 10k ES limit.
+#
+# Performance fixes vs. previous version:
+#   1. Tiebreaker changed from "_id" -> "_shard_doc"
+#      _id sort forces expensive field-data loading for every doc.
+#      _shard_doc is a built-in ES 7.12+ tiebreaker with zero overhead.
+#   2. Query clauses moved to "filter" context (was "must").
+#      filter skips relevance scoring and enables shard-level caching.
+#   3. "track_total_hits": false — stops ES counting every matching doc
+#      per page, which was adding significant overhead for large indices.
 # ---------------------------------------------------------------------------
 
-PAGE_SIZE  = 10000
-all_hits   = []
+PAGE_SIZE    = 10000
+all_hits     = []
 search_after = None
 
 while True:
     query_body = {
         "size": PAGE_SIZE,
+        "track_total_hits": False,
         "sort": [
             {"@timestamp": {"order": "asc"}},
-            {"_id":         {"order": "asc"}},
+            {"_shard_doc":  "asc"},
         ],
         "query": {
             "bool": {
-                "must": [
+                "filter": [
                     {"terms": {"scope.keyword": all_scopes}},
                     {
                         "range": {
@@ -122,7 +129,6 @@ while True:
     print(f"Page fetched: {len(hits)} records | Running total: {len(all_hits)}")
 
     if len(hits) < PAGE_SIZE:
-        # Fewer records than page size means this was the last page
         break
 
     # Advance the cursor to the sort values of the last hit
