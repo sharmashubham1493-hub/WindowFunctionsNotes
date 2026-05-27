@@ -1,8 +1,6 @@
 import requests
-import json
 import pytz
 from datetime import datetime, timedelta
-import warnings
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -14,11 +12,13 @@ spark = SparkSession.builder.appName("APiGEE_Ingestion_Daily").getOrCreate()
 
 # ── Config ───────────────────────────────────────────────────────────────────
 user = "apigee_obj"
-pwd  = "<<PASSWORD>>"   # replace with actual secret / dbutils.secrets.get(...)
+pwd  = "<<PASSWORD>>"   # replace with dbutils.secrets.get(...)
 
 kolkata_tz = pytz.timezone("Asia/Kolkata")
 
-url = "https://10.222.72.188:9200/apigee_updated/_search"
+SEARCH_URL = "https://10.222.72.188:9200/apigee_updated/_search"
+SCROLL_URL = "https://10.222.72.188:9200/_search/scroll"
+CLEAR_URL  = "https://10.222.72.188:9200/_search/scroll"
 
 headers = {
     "Content-Type": "application/vnd.elasticsearch+json; compatible-with=8",
@@ -33,95 +33,102 @@ SCOPE_JOURNEY_MAP = {
     "PBCC": "apigee-update-pbcc-logs",
 }
 
-# Elasticsearch hard cap per request — do NOT raise above index max_result_window
-PAGE_SIZE = 10_000
-
 # ── Date ─────────────────────────────────────────────────────────────────────
 file_date = (datetime.now(kolkata_tz).date() + timedelta(days=-1)).strftime("%Y-%m-%d")
 print(f"file_date: {file_date}")
 
-# ── Fetch all records using per-journey + paginated requests ──────────────────
-# WHY separate per journey:
-#   Querying all scopes together with size=10000 returns at most 10k records
-#   total across all journeys — leaving ~20k records unfetched.
-#   By querying one journey at a time we stay within the 10k window per scope,
-#   and we add from-based pagination so we also handle journeys that themselves
-#   exceed 10k records.
+all_scopes = list(SCOPE_JOURNEY_MAP.keys())
+print(f"all_scopes: {all_scopes}")
 
-all_hits = []
+# ── Fetch ALL records for all 5 journeys in one scroll loop ──────────────────
+# The Scroll API works like a cursor: the first request opens a scroll context
+# and returns a scroll_id; subsequent requests pass that scroll_id to get the
+# next page — no max_result_window limit applies.  We stop when a page is empty.
 
-for scope in SCOPE_JOURNEY_MAP:
-    from_offset = 0
-    journey_hits = []
+PAGE_SIZE   = 10_000   # records per page (max Elasticsearch will return at once)
+SCROLL_TTL  = "2m"     # how long the server keeps the scroll context alive
 
-    while True:
-        query_body = {
-            "size": PAGE_SIZE,
-            "from": from_offset,
-            "query": {
-                "bool": {
-                    "must": [
-                        {
-                            "range": {
-                                "@timestamp": {
-                                    "gte": f"{file_date}T00:00:00",
-                                    "lte": f"{file_date}T23:59:59",
-                                }
+# ── Step 1: open scroll with the initial search ──────────────────────────────
+initial_response = requests.post(
+    SEARCH_URL,
+    params={"scroll": SCROLL_TTL},
+    headers=headers,
+    auth=(user, pwd),
+    json={
+        "size": PAGE_SIZE,
+        "query": {
+            "bool": {
+                "must": [
+                    {
+                        "range": {
+                            "@timestamp": {
+                                "gte": f"{file_date}T00:00:00",
+                                "lte": f"{file_date}T23:59:59",
                             }
-                        },
-                        {
-                            "term": {
-                                "SCOPE_KEYWORD": scope
-                            }
-                        },
-                    ]
-                }
-            },
-        }
+                        }
+                    },
+                    {
+                        "terms": {
+                            "SCOPE_KEYWORD": all_scopes   # all 5 journeys in one query
+                        }
+                    },
+                ]
+            }
+        },
+    },
+    verify=False,
+    timeout=120,
+)
 
-        response = requests.post(
-            url,
-            headers=headers,
-            auth=(user, pwd),
-            json=query_body,
-            verify=False,
-            timeout=120,
-        )
+if initial_response.status_code != 200:
+    raise Exception(f"Initial scroll request failed: HTTP {initial_response.status_code} — {initial_response.text}")
 
-        if response.status_code != 200:
-            raise Exception(
-                f"API call failed for scope={scope}, from={from_offset}: "
-                f"HTTP {response.status_code} — {response.text}"
-            )
+data      = initial_response.json()
+scroll_id = data["_scroll_id"]
+total     = data["hits"]["total"]["value"]
+all_hits  = data["hits"]["hits"]
 
-        data      = response.json()
-        hits      = data["hits"]["hits"]
-        total     = data["hits"]["total"]["value"]
+print(f"Total records in index for {file_date}: {total}")
+print(f"Page 1: fetched {len(all_hits)} records")
 
-        journey_hits.extend(hits)
-        print(f"  scope={scope} | fetched {len(hits)} | cumulative {len(journey_hits)} / {total}")
+# ── Step 2: keep scrolling until no more hits ────────────────────────────────
+page = 2
+while True:
+    scroll_response = requests.post(
+        SCROLL_URL,
+        headers=headers,
+        auth=(user, pwd),
+        json={"scroll": SCROLL_TTL, "scroll_id": scroll_id},
+        verify=False,
+        timeout=120,
+    )
 
-        from_offset += PAGE_SIZE
+    if scroll_response.status_code != 200:
+        raise Exception(f"Scroll page {page} failed: HTTP {scroll_response.status_code} — {scroll_response.text}")
 
-        # Stop when we've fetched everything, or the page was empty
-        if not hits or from_offset >= total:
-            break
+    scroll_data = scroll_response.json()
+    scroll_id   = scroll_data["_scroll_id"]   # server may rotate the ID
+    hits        = scroll_data["hits"]["hits"]
 
-        # Guard: Elasticsearch max_result_window is typically 10 000.
-        # If a journey has >10 000 records, from+size pagination will fail
-        # beyond that boundary.  Raise early with a clear message so the fix
-        # (switch to Scroll or Search-After API) is obvious.
-        if from_offset >= 10_000:
-            raise RuntimeError(
-                f"scope={scope} has {total} records, which exceeds "
-                "Elasticsearch's default max_result_window=10000. "
-                "Switch this loop to the Scroll API or Search-After API."
-            )
+    if not hits:
+        print(f"No more records. Scroll complete.")
+        break
 
-    print(f"scope={scope}: {len(journey_hits)} records fetched (total in index: {total})")
-    all_hits.extend(journey_hits)
+    all_hits.extend(hits)
+    print(f"Page {page}: fetched {len(hits)} | cumulative {len(all_hits)} / {total}")
+    page += 1
 
-print(f"\nTotal records fetched across all journeys: {len(all_hits)}")
+# ── Step 3: clean up the scroll context on the server ────────────────────────
+requests.delete(
+    CLEAR_URL,
+    headers=headers,
+    auth=(user, pwd),
+    json={"scroll_id": scroll_id},
+    verify=False,
+    timeout=30,
+)
+
+print(f"\nTotal records fetched: {len(all_hits)} (expected: {total})")
 
 # ── Convert to Spark DataFrame ────────────────────────────────────────────────
 records = [hit["_source"] for hit in all_hits]
