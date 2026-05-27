@@ -30,18 +30,16 @@ while current_date <= end_date:
     file_date = current_date.strftime("%Y-%m-%d")
     print(file_date)
 
-    # 48 intervals of 30 minutes each (instead of 24 hourly)
-    for interval in range(48):
-        hour = interval // 2
-        minute_start = (interval % 2) * 30
-        minute_end = minute_start + 29
+    # 24 intervals of 1 hour each
+    for interval in range(24):
+        hour = interval
 
         # Build datetime objects in IST and convert to epoch milliseconds
         # to avoid Elasticsearch date-format parse errors
         start_dt = datetime(current_date.year, current_date.month, current_date.day,
-                            hour, minute_start, 0, tzinfo=kolkata_tz)
+                            hour, 0, 0, tzinfo=kolkata_tz)
         end_dt   = datetime(current_date.year, current_date.month, current_date.day,
-                            hour, minute_end, 59, tzinfo=kolkata_tz)
+                            hour, 59, 59, tzinfo=kolkata_tz)
 
         start_epoch = int(start_dt.timestamp() * 1000)
         end_epoch   = int(end_dt.timestamp() * 1000)
@@ -50,7 +48,7 @@ while current_date <= end_date:
         start_time = start_dt.strftime('%Y-%m-%dT%H:%M:%S')
         end_time   = end_dt.strftime('%Y-%m-%dT%H:%M:%S')
 
-        print(f"Fetching interval {interval + 1}/48: {start_time} to {end_time}")
+        print(f"Fetching interval {interval + 1}/24: {start_time} to {end_time}")
 
         response = requests.post(
             url,
@@ -71,7 +69,7 @@ while current_date <= end_date:
 
         if response.status_code != 200:
             raise Exception(
-                f"API call failed for interval {interval + 1}/48: {response.text[:1000]}"
+                f"API call failed for interval {interval + 1}/24: {response.text[:1000]}"
             )
 
         hits = response.json().get("hits", {}).get("hits", [])
