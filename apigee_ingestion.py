@@ -19,9 +19,9 @@ all_scopes = list(SCOPE_JOURNEY_MAP.keys())
 # scope = ['GMCC']
 print("all_scopes:", (all_scopes))
 
-# Date range: 1 May 2025 to 26 May 2025
-start_date = datetime(2025, 5, 1).date()
-end_date = datetime(2025, 5, 26).date()
+# Date range: 1 May 2026 to 26 May 2026
+start_date = datetime(2026, 5, 1).date()
+end_date = datetime(2026, 5, 26).date()
 
 all_hits = []
 
@@ -47,7 +47,7 @@ while current_date <= end_date:
             auth=(user, pwd),
             json={
                 "query": {"bool": {"must": [
-                    {"range": {"@timestamp": {"gte": start_time, "lte": end_time}}},
+                    {"range": {"@timestamp": {"gte": start_time, "lte": end_time, "format": "strict_date_hour_minute_second_fraction"}}},
                     {"terms": {"Scope Keyword": all_scopes}},
                 ]}},
                 "fields": ["*"],
