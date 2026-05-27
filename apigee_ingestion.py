@@ -73,16 +73,18 @@ file_date = (
 ).strftime("%Y-%m-%d")
 print(file_date)
 
-# --- MODIFIED: ingest in 24 x 1-hour intervals (one API request per hour) ---
+# --- MODIFIED: ingest in 48 x 30-minute intervals (two API requests per hour) ---
 all_hits = []
 
-for interval in range(24):
-    start_hour = interval            # 0, 1, 2, ..., 23
+for interval in range(48):
+    start_hour   = interval // 2          # 0,0,1,1,2,2,...,23,23
+    start_minute = (interval % 2) * 30    # 0,30,0,30,...
+    end_minute   = start_minute + 29      # 29,59,29,59,...
 
-    start_time = f"{file_date}T{start_hour:02d}:00:00.000"
-    end_time   = f"{file_date}T{start_hour:02d}:59:59.999"
+    start_time = f"{file_date}T{start_hour:02d}:{start_minute:02d}:00.000"
+    end_time   = f"{file_date}T{start_hour:02d}:{end_minute:02d}:59.999"
 
-    print(f"Fetching interval {interval + 1}/24: {start_time} to {end_time}")
+    print(f"Fetching interval {interval + 1}/48: {start_time} to {end_time}")
 
     response = requests.post(
         url,
@@ -136,5 +138,5 @@ for interval in range(24):
     )
 
 # outside the loop
-print(f"\nAll 24 intervals fetched successfully.")
+print(f"\nAll 48 intervals fetched successfully.")
 print(f"Total records fetched: {len(all_hits)}")
