@@ -1,7 +1,7 @@
 # Databricks notebook source
 import requests
 import pytz
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 kolkata_tz = pytz.timezone("Asia/Kolkata")
 
@@ -34,12 +34,12 @@ while current_date <= end_date:
     for interval in range(24):
         hour = interval
 
-        # Build datetime objects in IST and convert to epoch milliseconds
-        # to avoid Elasticsearch date-format parse errors
+        # Use UTC (no offset) so epoch_millis matches how ES interprets
+        # plain date strings like "2026-05-01T00:00:00.000" (no timezone = UTC)
         start_dt = datetime(current_date.year, current_date.month, current_date.day,
-                            hour, 0, 0, tzinfo=kolkata_tz)
+                            hour, 0, 0, tzinfo=timezone.utc)
         end_dt   = datetime(current_date.year, current_date.month, current_date.day,
-                            hour, 59, 59, tzinfo=kolkata_tz)
+                            hour, 59, 59, tzinfo=timezone.utc)
 
         start_epoch = int(start_dt.timestamp() * 1000)
         end_epoch   = int(end_dt.timestamp() * 1000)
