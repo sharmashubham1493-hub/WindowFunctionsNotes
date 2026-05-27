@@ -36,8 +36,19 @@ while current_date <= end_date:
         minute_start = (interval % 2) * 30
         minute_end = minute_start + 29
 
-        start_time = f'{file_date}T{hour:02d}:{minute_start:02d}:00.000'
-        end_time   = f'{file_date}T{hour:02d}:{minute_end:02d}:59.999'
+        # Build datetime objects in IST and convert to epoch milliseconds
+        # to avoid Elasticsearch date-format parse errors
+        start_dt = datetime(current_date.year, current_date.month, current_date.day,
+                            hour, minute_start, 0, tzinfo=kolkata_tz)
+        end_dt   = datetime(current_date.year, current_date.month, current_date.day,
+                            hour, minute_end, 59, tzinfo=kolkata_tz)
+
+        start_epoch = int(start_dt.timestamp() * 1000)
+        end_epoch   = int(end_dt.timestamp() * 1000)
+
+        # Human-readable label for logging only
+        start_time = start_dt.strftime('%Y-%m-%dT%H:%M:%S')
+        end_time   = end_dt.strftime('%Y-%m-%dT%H:%M:%S')
 
         print(f"Fetching interval {interval + 1}/48: {start_time} to {end_time}")
 
@@ -47,7 +58,7 @@ while current_date <= end_date:
             auth=(user, pwd),
             json={
                 "query": {"bool": {"must": [
-                    {"range": {"@timestamp": {"gte": start_time, "lte": end_time, "format": "strict_date_hour_minute_second_fraction"}}},
+                    {"range": {"@timestamp": {"gte": start_epoch, "lte": end_epoch, "format": "epoch_millis"}}},
                     {"terms": {"Scope Keyword": all_scopes}},
                 ]}},
                 "fields": ["*"],
