@@ -78,7 +78,7 @@ all_hits = []
 
 for interval in range(12):
     start_hour = interval * 2        # 0, 2, 4, ..., 22
-    end_hour = start_hour + 1        # 1, 3, 5, ..., 23  (covers HH:00:00 – HH+1:59:59)
+    end_hour   = start_hour + 1      # 1, 3, 5, ..., 23  (covers HH:00:00 – HH+1:59:59)
 
     start_time = f"{file_date}T{start_hour:02d}:00:00.000"
     end_time   = f"{file_date}T{end_hour:02d}:59:59.999"
@@ -112,16 +112,30 @@ for interval in range(12):
         timeout=120,
     )
 
-    print(f"HTTP status : {response.status_code}")
     if response.status_code != 200:
         raise Exception(
             f"API call failed for interval {start_time} - {end_time}: "
             f"{response.text[:100]}"
         )
 
-    hits = response.json().get("hits", {}).get("hits", [])
-    all_hits.extend(hits)
-    print(f"  -> Records in this interval: {len(hits)} | Total so far: {len(all_hits)}")
+    # ------------------------------------------------------------------
+    # IMPORTANT: parse THIS interval's response — do NOT use a variable
+    # called response_json from a previous cell; that would be stale.
+    # Everything below must stay inside the for-loop (indented 4 spaces).
+    # ------------------------------------------------------------------
+    resp_json   = response.json()
+    total_in_es = resp_json.get("hits", {}).get("total", {}).get("value", "?")
+    hits        = resp_json.get("hits", {}).get("hits", [])
 
+    all_hits.extend(hits)                          # ← INSIDE the loop
+
+    print(
+        f"  HTTP {response.status_code} | "
+        f"ES total for this window: {total_in_es} | "
+        f"returned: {len(hits)} | "
+        f"running total: {len(all_hits)}"
+    )
+
+# outside the loop
 print(f"\nAll 12 intervals fetched successfully.")
 print(f"Total records fetched: {len(all_hits)}")
