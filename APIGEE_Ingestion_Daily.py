@@ -2,28 +2,26 @@
 
 # COMMAND ----------
 import warnings
-import time
+import os
+import json
+import shutil
 from datetime import datetime, timedelta
 import pytz
+import requests
+import urllib3
 from pyspark.sql import SparkSession
 import pyspark.sql.functions as F
 from pyspark.sql.functions import lit, col
-import os
-import pandas as pd
-import urllib3
-import json
-import requests
+from pyspark.sql.types import StringType
 
 # COMMAND ----------
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Initialize Spark session
 spark = SparkSession.builder.appName("APIGEE_Ingestion_Daily").getOrCreate()
 
 # COMMAND ----------
-# Setup the batch id for this job
-print(f"Setting up the batch id for this job")
-batch_id = str(datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y%m%d_%H%M%S"))
+print("Setting up batch id...")
+batch_id = datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y%m%d_%H%M%S")
 
 # COMMAND ----------
 SCOPE_JOURNEY_MAP = {
@@ -49,25 +47,31 @@ headers = {
 }
 
 file_date = (datetime.now(kolkata_tz).date() - timedelta(days=1)).strftime("%Y-%m-%d")
-print(file_date)
+print(f"file_date : {file_date}")
 
-# Scopes split by URL
 scope_url1 = ["SWCC", "TDCC"]
 scope_url2 = ["PPCC", "PBCC", "PTCC"]
 
 print(f"URL_1 scopes : {scope_url1}")
 print(f"URL_2 scopes : {scope_url2}")
 
+# Temp DBFS paths — one folder per URL, each interval written as a separate JSON part
+tmp_base   = f"/dbfs/tmp/apigee_ingestion/{batch_id}"
+dbfs_url1  = f"dbfs:/tmp/apigee_ingestion/{batch_id}/url1"
+dbfs_url2  = f"dbfs:/tmp/apigee_ingestion/{batch_id}/url2"
+
+os.makedirs(f"{tmp_base}/url1", exist_ok=True)
+os.makedirs(f"{tmp_base}/url2", exist_ok=True)
+
 # COMMAND ----------
-# ── Fetch from URL_1 (SWCC + TDCC) ──────────────────────────────────────────
-all_hits_1 = []
+# ── Fetch from URL_1 (SWCC + TDCC) — write each interval straight to DBFS ───
+# No Python list accumulation: one hour at a time → disk → next hour.
+total_hits_1 = 0
 
 for interval in range(24):
-    start_hour = interval
-    start_time = f"{file_date}T{start_hour:02d}:00:00.000"
-    end_time   = f"{file_date}T{start_hour:02d}:59:59.999"
-
-    print(f"[URL_1] Fetching interval {(interval + 1):02d}/24: {start_time} to {end_time}")
+    start_time = f"{file_date}T{interval:02d}:00:00.000"
+    end_time   = f"{file_date}T{interval:02d}:59:59.999"
+    print(f"[URL_1] interval {interval + 1:02d}/24 : {start_time}  →  {end_time}")
 
     response = requests.post(
         url_1,
@@ -76,14 +80,10 @@ for interval in range(24):
         json={
             "size": 10000,
             "fields": ["*"],
-            "query": {
-                "bool": {
-                    "must": [
-                        {"range": {"@timestamp": {"gte": start_time, "lte": end_time}}},
-                        {"terms": {"Scope.keyword": scope_url1}},
-                    ]
-                }
-            },
+            "query": {"bool": {"must": [
+                {"range": {"@timestamp": {"gte": start_time, "lte": end_time}}},
+                {"terms": {"Scope.keyword": scope_url1}},
+            ]}},
         },
         verify=False,
         timeout=120,
@@ -91,26 +91,31 @@ for interval in range(24):
 
     if response.status_code != 200:
         raise Exception(
-            f"[URL_1] API call failed for interval {start_time} - {end_time}: "
-            f"{response.text[:100]}"
+            f"[URL_1] API failed {start_time}-{end_time}: {response.text[:100]}"
         )
 
-    resp_json = response.json()
-    hits = resp_json.get("hits", {}).get("hits", [])
-    all_hits_1.extend(hits)
+    hits = response.json().get("hits", {}).get("hits", [])
+    total_hits_1 += len(hits)
 
-print(f"\n[URL_1] All 24 intervals fetched. Total records: {len(all_hits_1)}")
+    # Flatten and write this interval immediately; do not keep in memory
+    lines = [
+        json.dumps({k: (v[0] if isinstance(v, list) and v else v)
+                    for k, v in record["fields"].items()})
+        for record in hits
+    ]
+    with open(f"{tmp_base}/url1/part_{interval:02d}.json", "w") as fh:
+        fh.write("\n".join(lines))
+
+print(f"\n[URL_1] Done. Total records written to DBFS: {total_hits_1}")
 
 # COMMAND ----------
-# ── Fetch from URL_2 (PPCC + PBCC + PTCC) ───────────────────────────────────
-all_hits_2 = []
+# ── Fetch from URL_2 (PPCC + PBCC + PTCC) — same pattern ────────────────────
+total_hits_2 = 0
 
 for interval in range(24):
-    start_hour = interval
-    start_time = f"{file_date}T{start_hour:02d}:00:00.000"
-    end_time   = f"{file_date}T{start_hour:02d}:59:59.999"
-
-    print(f"[URL_2] Fetching interval {(interval + 1):02d}/24: {start_time} to {end_time}")
+    start_time = f"{file_date}T{interval:02d}:00:00.000"
+    end_time   = f"{file_date}T{interval:02d}:59:59.999"
+    print(f"[URL_2] interval {interval + 1:02d}/24 : {start_time}  →  {end_time}")
 
     response = requests.post(
         url_2,
@@ -119,14 +124,10 @@ for interval in range(24):
         json={
             "size": 10000,
             "fields": ["*"],
-            "query": {
-                "bool": {
-                    "must": [
-                        {"range": {"@timestamp": {"gte": start_time, "lte": end_time}}},
-                        {"terms": {"Scope.keyword": scope_url2}},
-                    ]
-                }
-            },
+            "query": {"bool": {"must": [
+                {"range": {"@timestamp": {"gte": start_time, "lte": end_time}}},
+                {"terms": {"Scope.keyword": scope_url2}},
+            ]}},
         },
         verify=False,
         timeout=120,
@@ -134,43 +135,37 @@ for interval in range(24):
 
     if response.status_code != 200:
         raise Exception(
-            f"[URL_2] API call failed for interval {start_time} - {end_time}: "
-            f"{response.text[:100]}"
+            f"[URL_2] API failed {start_time}-{end_time}: {response.text[:100]}"
         )
 
-    resp_json = response.json()
-    hits = resp_json.get("hits", {}).get("hits", [])
-    all_hits_2.extend(hits)
+    hits = response.json().get("hits", {}).get("hits", [])
+    total_hits_2 += len(hits)
 
-print(f"\n[URL_2] All 24 intervals fetched. Total records: {len(all_hits_2)}")
+    lines = [
+        json.dumps({k: (v[0] if isinstance(v, list) and v else v)
+                    for k, v in record["fields"].items()})
+        for record in hits
+    ]
+    with open(f"{tmp_base}/url2/part_{interval:02d}.json", "w") as fh:
+        fh.write("\n".join(lines))
 
-# COMMAND ----------
-# ── Build df_1 from URL_1 hits (SWCC + TDCC) ────────────────────────────────
-def hits_to_dataframe(all_hits, label):
-    flattened_records = []
-    for record in all_hits:
-        flat = {}
-        for key, value in record["fields"].items():
-            flat[key] = value[0] if isinstance(value, list) and len(value) > 0 else value
-        flattened_records.append(flat)
-
-    rdd = spark.sparkContext.parallelize([json.dumps(r) for r in flattened_records])
-    df = spark.read.option("mergeSchema", "true").json(rdd)
-    print(f"[{label}] columns: {len(df.columns)}, records (from API): {len(all_hits)}")
-    return df
-
-
-df_1 = hits_to_dataframe(all_hits_1, "URL_1 / SWCC+TDCC")
-df_2 = hits_to_dataframe(all_hits_2, "URL_2 / PPCC+PBCC+PTCC")
+print(f"\n[URL_2] Done. Total records written to DBFS: {total_hits_2}")
 
 # COMMAND ----------
-# ── Combine df_1 and df_2 ────────────────────────────────────────────────────
+# ── Read df_1 and df_2 from DBFS (Spark reads distributed — not into driver) ─
+df_1 = spark.read.option("mergeSchema", "true").json(dbfs_url1)
+df_2 = spark.read.option("mergeSchema", "true").json(dbfs_url2)
+
+print(f"[df_1 / SWCC+TDCC]       columns : {len(df_1.columns)}")
+print(f"[df_2 / PPCC+PBCC+PTCC]  columns : {len(df_2.columns)}")
+
+# COMMAND ----------
+# ── Combine ──────────────────────────────────────────────────────────────────
 combined_df = df_1.unionByName(df_2, allowMissingColumns=True)
-print(f"Combined DataFrame — columns: {len(combined_df.columns)}, total records (from API): {len(all_hits_1) + len(all_hits_2)}")
+print(f"Combined DataFrame — columns: {len(combined_df.columns)}, "
+      f"total records (from API): {total_hits_1 + total_hits_2}")
 
 # COMMAND ----------
-from pyspark.sql.types import StringType
-
 MASTER_COLUMNS = [
     "@timestamp",
     "APIProxyType",
@@ -284,7 +279,12 @@ for scope_val, journey in SCOPE_JOURNEY_MAP.items():
     job_results.append({"journey": journey, "status": "SUCCESS", "records": count})
 
 # COMMAND ----------
-# ── Summary ──────────────────────────────────────────────────────────────────
+# ── Summary ───────────────────────────────────────────────────────────────────
 print("\n===== Job Results =====")
 for r in job_results:
     print(r)
+
+# COMMAND ----------
+# ── Cleanup DBFS temp files ───────────────────────────────────────────────────
+shutil.rmtree(f"{tmp_base}", ignore_errors=True)
+print(f"Cleaned up temp path: {tmp_base}")
