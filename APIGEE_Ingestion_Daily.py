@@ -156,7 +156,7 @@ def hits_to_dataframe(all_hits, label):
 
     rdd = spark.sparkContext.parallelize([json.dumps(r) for r in flattened_records])
     df = spark.read.option("mergeSchema", "true").json(rdd)
-    print(f"[{label}] total columns: {len(df.columns)}, total rows: {df.count()}")
+    print(f"[{label}] columns: {len(df.columns)}, records (from API): {len(all_hits)}")
     return df
 
 
@@ -166,7 +166,7 @@ df_2 = hits_to_dataframe(all_hits_2, "URL_2 / PPCC+PBCC+PTCC")
 # COMMAND ----------
 # ── Combine df_1 and df_2 ────────────────────────────────────────────────────
 combined_df = df_1.unionByName(df_2, allowMissingColumns=True)
-print(f"Combined DataFrame — rows: {combined_df.count()}, columns: {len(combined_df.columns)}")
+print(f"Combined DataFrame — columns: {len(combined_df.columns)}, total records (from API): {len(all_hits_1) + len(all_hits_2)}")
 
 # COMMAND ----------
 from pyspark.sql.types import StringType
