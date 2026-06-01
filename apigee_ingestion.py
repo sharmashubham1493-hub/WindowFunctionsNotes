@@ -70,18 +70,22 @@ file_date = (
 ).strftime("%Y-%m-%d")
 print(file_date)
 
-# --- MODIFIED: ingest in 2 x 15-hour intervals covering the full day ---
-INTERVAL_HOURS = 15
+# --- MODIFIED: ingest in 96 x 15-minute intervals covering the full day ---
+INTERVAL_MINUTES = 15
+total_intervals = (24 * 60) // INTERVAL_MINUTES  # 96
 all_hits = []
 
-interval_starts = range(0, 24, INTERVAL_HOURS)  # [0, 15]
-total_intervals = len(list(interval_starts))
+for i in range(total_intervals):
+    start_total_min = i * INTERVAL_MINUTES
+    end_total_min   = start_total_min + INTERVAL_MINUTES - 1
 
-for i, start_hour in enumerate(range(0, 24, INTERVAL_HOURS)):
-    end_hour = min(start_hour + INTERVAL_HOURS, 24) - 1  # 14 and 23
+    start_hour   = start_total_min // 60
+    start_minute = start_total_min % 60
+    end_hour     = end_total_min // 60
+    end_minute   = end_total_min % 60
 
-    start_time = f"{file_date}T{start_hour:02d}:00:00.000"
-    end_time   = f"{file_date}T{end_hour:02d}:59:59.999"
+    start_time = f"{file_date}T{start_hour:02d}:{start_minute:02d}:00.000"
+    end_time   = f"{file_date}T{end_hour:02d}:{end_minute:02d}:59.999"
 
     print(f"Fetching interval {i + 1}/{total_intervals}: {start_time} to {end_time}")
 
