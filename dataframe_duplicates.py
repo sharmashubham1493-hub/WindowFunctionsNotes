@@ -53,37 +53,42 @@ dup_txn_ids = dup_txn_df.select("transaction_id")
 display(df.join(dup_txn_ids, on="transaction_id", how="inner").orderBy("transaction_id"))
 
 
-# ── Investigate count mismatch vs source (Elastic = 177,195) ─────────────
-# Databricks shows 180,348 vs Elastic 177,195 → 3,153 extra records
-# Root cause 1: time range mismatch — Elastic query ends at 23:30, not midnight
+# ── Count comparison: Databricks vs Elastic source ───────────────────────
+# Confirmed counts (full day: May 31 00:00 → 23:59:59):
+#   Databricks distinct Transaction_id : 180,348
+#   Elastic COUNT_DISTINCT(Transaction_id): 180,593
+#   → Databricks is MISSING 245 records from the source
 
-# Check the actual time range in df
-print("=== Time range in Databricks df ===")
+DATABRICKS_DISTINCT = 180_348
+ELASTIC_DISTINCT    = 180_593
+MISSING             = ELASTIC_DISTINCT - DATABRICKS_DISTINCT   # 245
+
+print(f"Databricks distinct Transaction_ids : {DATABRICKS_DISTINCT}")
+print(f"Elastic distinct Transaction_ids    : {ELASTIC_DISTINCT}")
+print(f"Records MISSING from Databricks     : {MISSING}")
+
+# ── Find the timestamp range of what IS in Databricks ─────────────────────
+# This helps confirm whether the 245 are late-arriving records or lost ones.
+print("\n=== Timestamp range in Databricks df ===")
 df.select(
     F.min("timestamp").alias("min_timestamp"),
     F.max("timestamp").alias("max_timestamp")
 ).show(truncate=False)
 
-# Count records WITHIN the same window Elastic used (00:00 → 23:30)
-ELASTIC_START = "2026-05-31T00:00:00"
-ELASTIC_END   = "2026-05-31T23:30:00"
-
-df_elastic_window = df.filter(
-    (F.col("timestamp") >= ELASTIC_START) &
-    (F.col("timestamp") <= ELASTIC_END)
+# ── Investigate WHERE the gap is — which part of the day is thin? ─────────
+# Bucket by hour to see if a particular hour is under-ingested
+print("\n=== Record count per hour (Databricks) ===")
+(
+    df.withColumn("hour", F.date_format(F.col("timestamp").cast("timestamp"), "HH"))
+      .groupBy("hour")
+      .agg(F.count("*").alias("record_count"),
+           F.countDistinct("Transaction_id").alias("distinct_txn_ids"))
+      .orderBy("hour")
+      .show(24, truncate=False)
 )
 
-elastic_window_distinct = df_elastic_window.select("transaction_id").distinct().count()
-print(f"\nDistinct transaction_ids in Elastic window ({ELASTIC_START} → {ELASTIC_END}): {elastic_window_distinct}")
-ELASTIC_DISTINCT = 177195
-DATABRICKS_TOTAL = 180348
-print(f"Elastic portal shows : {ELASTIC_DISTINCT}")
-print(f"Databricks total     : {DATABRICKS_TOTAL}")
-print(f"Gap                  : {DATABRICKS_TOTAL - ELASTIC_DISTINCT}")   # 3,153
-print(f"Remaining gap after window filter: {elastic_window_distinct - ELASTIC_DISTINCT}")
-
-# Root cause 2: records ingested more than once (same txn_id, different ingest time)
-# Check if timestamp column is the event time or ingest time
-# If there's a separate ingest/processing timestamp column, compare it
-print("\n=== Sample columns to check for ingest timestamp ===")
-print([c for c in df.columns if any(k in c.lower() for k in ["ingest", "load", "insert", "process", "created", "received"])])
+# ── Possible root causes for 245 missing records ──────────────────────────
+# 1. Late-arriving events: records written to Elastic after the Databricks
+#    ingestion job ran (last few minutes of the day)
+# 2. Ingestion job timeout/failure on a micro-batch
+# 3. Records filtered out by a transformation in the pipeline
