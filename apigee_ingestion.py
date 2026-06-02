@@ -134,8 +134,8 @@ for i in range(total_intervals):
     )
 
     if hits:
-        interval_df = pandas.DataFrame([h.get("_source", {}) for h in hits])
-        print(interval_df.to_string())
+        for record in hits:
+            print(json.dumps(record.get("_source", {}), indent=2, default=str))
         print()
 
 print(f"\nAll {total_intervals} intervals fetched successfully.")
