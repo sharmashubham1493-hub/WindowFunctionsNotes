@@ -133,10 +133,6 @@ for i in range(total_intervals):
         f"running total: {len(all_hits)}"
     )
 
-    if hits:
-        for record in hits:
-            print(json.dumps(record.get("_source", {}), indent=2, default=str))
-        print()
 
 print(f"\nAll {total_intervals} intervals fetched successfully.")
 print(f"Total records fetched: {len(all_hits)}")
