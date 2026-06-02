@@ -54,7 +54,7 @@ display(df.join(dup_txn_ids, on="transaction_id", how="inner").orderBy("transact
 
 
 # ── Investigate count mismatch vs source (Elastic = 177,195) ─────────────
-# Databricks shows 188,348 vs Elastic 177,195 → 11,153 extra records
+# Databricks shows 180,348 vs Elastic 177,195 → 3,153 extra records
 # Root cause 1: time range mismatch — Elastic query ends at 23:30, not midnight
 
 # Check the actual time range in df
@@ -75,8 +75,12 @@ df_elastic_window = df.filter(
 
 elastic_window_distinct = df_elastic_window.select("transaction_id").distinct().count()
 print(f"\nDistinct transaction_ids in Elastic window ({ELASTIC_START} → {ELASTIC_END}): {elastic_window_distinct}")
-print(f"Elastic portal shows : 177195")
-print(f"Remaining gap        : {elastic_window_distinct - 177195}")
+ELASTIC_DISTINCT = 177195
+DATABRICKS_TOTAL = 180348
+print(f"Elastic portal shows : {ELASTIC_DISTINCT}")
+print(f"Databricks total     : {DATABRICKS_TOTAL}")
+print(f"Gap                  : {DATABRICKS_TOTAL - ELASTIC_DISTINCT}")   # 3,153
+print(f"Remaining gap after window filter: {elastic_window_distinct - ELASTIC_DISTINCT}")
 
 # Root cause 2: records ingested more than once (same txn_id, different ingest time)
 # Check if timestamp column is the event time or ingest time
