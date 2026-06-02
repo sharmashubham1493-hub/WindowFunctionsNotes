@@ -30,17 +30,25 @@ while current_date <= end_date:
     file_date = current_date.strftime("%Y-%m-%d")
     print(file_date)
 
-    # 96 intervals of 15 minutes each
-    for interval in range(96):
-        hour = interval // 4
-        minute = (interval % 4) * 15
+    # 144 intervals of 10 minutes each
+    interval_minute = 10
+    total_intervals = (24 * 60) // interval_minute
+
+    for interval in range(total_intervals):
+        start_total_min = interval * interval_minute
+        end_total_min   = start_total_min + interval_minute - 1
+
+        start_hour   = start_total_min // 60
+        start_minute = start_total_min % 60
+        end_hour     = end_total_min // 60
+        end_minute   = end_total_min % 60
 
         # Use UTC so epoch_millis matches how ES interprets plain date strings
         # (no timezone = UTC). pytz.utc is already available from the import above.
         start_dt = datetime(current_date.year, current_date.month, current_date.day,
-                            hour, minute, 0, tzinfo=pytz.utc)
+                            start_hour, start_minute, 0, tzinfo=pytz.utc)
         end_dt   = datetime(current_date.year, current_date.month, current_date.day,
-                            hour, minute + 14, 59, tzinfo=pytz.utc)
+                            end_hour, end_minute, 59, tzinfo=pytz.utc)
 
         start_epoch = int(start_dt.timestamp() * 1000)
         end_epoch   = int(end_dt.timestamp() * 1000)
@@ -49,7 +57,7 @@ while current_date <= end_date:
         start_time = start_dt.strftime('%Y-%m-%dT%H:%M:%S')
         end_time   = end_dt.strftime('%Y-%m-%dT%H:%M:%S')
 
-        print(f"Fetching interval {interval + 1}/96: {start_time} to {end_time}")
+        print(f"Fetching interval {interval + 1}/{total_intervals}: {start_time} to {end_time}")
 
         response = requests.post(
             url,
@@ -70,12 +78,12 @@ while current_date <= end_date:
 
         if response.status_code != 200:
             raise Exception(
-                f"API call failed for interval {interval + 1}/96: {response.text[:1000]}"
+                f"API call failed for interval {interval + 1}/{total_intervals}: {response.text[:1000]}"
             )
 
         hits = response.json().get("hits", {}).get("hits", [])
         all_hits.extend(hits)
-        print(f"{interval + 1} interval records: {len(hits)} | running total: {len(all_hits)}")
+        print(f"{interval + 1}/{total_intervals} interval records: {len(hits)} | running total: {len(all_hits)}")
 
     current_date += timedelta(days=1)
 
