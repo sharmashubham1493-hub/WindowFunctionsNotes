@@ -51,3 +51,35 @@ display(dup_txn_df)
 # Full rows for those duplicate transaction_ids
 dup_txn_ids = dup_txn_df.select("transaction_id")
 display(df.join(dup_txn_ids, on="transaction_id", how="inner").orderBy("transaction_id"))
+
+
+# ── Investigate count mismatch vs source (Elastic = 177,195) ─────────────
+# Databricks shows 188,348 vs Elastic 177,195 → 11,153 extra records
+# Root cause 1: time range mismatch — Elastic query ends at 23:30, not midnight
+
+# Check the actual time range in df
+print("=== Time range in Databricks df ===")
+df.select(
+    F.min("timestamp").alias("min_timestamp"),
+    F.max("timestamp").alias("max_timestamp")
+).show(truncate=False)
+
+# Count records WITHIN the same window Elastic used (00:00 → 23:30)
+ELASTIC_START = "2026-05-31T00:00:00"
+ELASTIC_END   = "2026-05-31T23:30:00"
+
+df_elastic_window = df.filter(
+    (F.col("timestamp") >= ELASTIC_START) &
+    (F.col("timestamp") <= ELASTIC_END)
+)
+
+elastic_window_distinct = df_elastic_window.select("transaction_id").distinct().count()
+print(f"\nDistinct transaction_ids in Elastic window ({ELASTIC_START} → {ELASTIC_END}): {elastic_window_distinct}")
+print(f"Elastic portal shows : 177195")
+print(f"Remaining gap        : {elastic_window_distinct - 177195}")
+
+# Root cause 2: records ingested more than once (same txn_id, different ingest time)
+# Check if timestamp column is the event time or ingest time
+# If there's a separate ingest/processing timestamp column, compare it
+print("\n=== Sample columns to check for ingest timestamp ===")
+print([c for c in df.columns if any(k in c.lower() for k in ["ingest", "load", "insert", "process", "created", "received"])])
