@@ -129,11 +129,14 @@ for i in range(total_intervals):
     all_hits.extend(hits)
 
     print(
-        f"  HTTP {response.status_code} | "
-        f"ES total for this window: {total_in_es} | "
-        f"returned: {len(hits)} | "
+        f"  interval records: {len(hits)} | "
         f"running total: {len(all_hits)}"
     )
+
+    if hits:
+        interval_df = pandas.DataFrame([h.get("_source", {}) for h in hits])
+        print(interval_df.to_string())
+        print()
 
 print(f"\nAll {total_intervals} intervals fetched successfully.")
 print(f"Total records fetched: {len(all_hits)}")
