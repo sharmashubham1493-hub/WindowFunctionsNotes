@@ -1,17 +1,7 @@
 # Databricks notebook source
-# APIGEE Data Ingestion - 30-Minute Interval with Full Pagination
-#
-# Key change from 15-min version:
-#   - interval_minute changed from 15 → 30  (48 API calls per journey instead of 96)
-#   - Added search_after pagination so every window fetches ALL records, not just the first 10,000
-#
-# Why this matters:
-#   Elasticsearch caps a single response at 10,000 hits (the "size" limit).
-#   With 30-min windows the record count per window doubles, so any window with
-#   >10,000 hits would silently truncate without pagination.
-#   search_after pages through results in sorted order until the window is exhausted.
 
 # COMMAND ----------
+# Cell 1 – Imports (image 1)
 
 import requests
 import json
@@ -21,50 +11,177 @@ import pytz
 import uuid
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import lit, current_timestamp, col
-from pyspark.sql import functions as F
-from pyspark.sql.types import StringType
 from requests.auth import HTTPBasicAuth
 from io import StringIO
 import pandas as pd
 import urllib3
 import os
 
+# COMMAND ----------
+# Cell 2 – Suppress SSL warnings (image 1)
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # COMMAND ----------
+# Cell 3 – Initialise Spark session (image 1)
 
 # Initialize Spark session
 spark = SparkSession.builder.appName("APIGEE_Ingestion_Daily").getOrCreate()
 
 # COMMAND ----------
+# Cell 4 – Timezone (referenced in cell 8 via kolkata_tz)
 
-# Timezone
 kolkata_tz = pytz.timezone("Asia/Kolkata")
 
 # COMMAND ----------
+# Cell 5 – Journey map (image 2)
 
-# Elasticsearch credentials and endpoint
+SCOPE_JOURNEY_MAP = {
+    "VTCC": "apigee-update-vtcc-logs",
+    "TDC":  "apigee-update-tdc-logs",
+    "PFCC": "apigee-update-pfcc-logs",
+    "PBCC": "apigee-update-pbcc-logs",
+    "PTCC": "apigee-update-ptcc-logs",
+}
+
+# COMMAND ----------
+# Cell 6 – Credentials (image 2)
+
 user = "apigee_dap"
-pwd  = dbutils.secrets.get(scope="apigee_dap", key="apigee_dap")   # keep secret out of plain text
+pwd  = dbutils.secrets.get(scope="apigee_dap", key="apigee_dap")
+
+# COMMAND ----------
+# Cell 7 – Elasticsearch endpoint + headers (image 2)
 
 update_url = "https://10.227.12.188:9201/apigee_updated_solace/_search"
 
 headers = {
     "Content-Type": "application/json",
-    "Accept": "application/json; compatible-with=8",
+    "Accept":        "application/json; compatible-with=8",
 }
 
 # COMMAND ----------
+# Cell 8 – Fetch loop  (images 3 & 4)
+#
+# CHANGES vs original:
+#   1. interval_minute : 15  →  30   (48 API calls/day instead of 96)
+#   2. Single requests.post replaced with a search_after pagination loop so
+#      every record in a 30-min window is fetched even when it exceeds 10 000 hits.
 
-SCOPE_JOURNEY_MAP = {
-    "VTCC":  "apigee-update-vtcc-logs",
-    "TDC":   "apigee-update-tdc-logs",
-    "PFCC":  "apigee-update-pfcc-logs",
-    "PBCC":  "apigee-update-pbcc-logs",
-    "PTCC":  "apigee-update-ptcc-logs",
-}
+all_scopes = list(SCOPE_JOURNEY_MAP.keys())
+# scope = ['VTCC', 'TDC', 'PFCC']
+# scope = ['PBCC', 'PTCC']
+
+file_date = (datetime.now(kolkata_tz).date() - timedelta(days=2)).strftime("%Y-%m-%d")
+batch_id  = datetime.now(kolkata_tz).strftime("%Y%m%d%H%M%S")
+print(file_date)
+
+# ── CHANGED 15 → 30 ──────────────────────────────────────────────────────────
+interval_minute = 30                               # was 15
+total_intervals = (24 * 60) // interval_minute     # 48 windows  (was 96)
+# ─────────────────────────────────────────────────────────────────────────────
+
+all_hits        = []
+start_total_min = 0
+
+for i in range(total_intervals):
+    end_total_min  = start_total_min + interval_minute
+
+    start_hour, start_min_part = divmod(start_total_min,      60)
+    end_hour,   end_min_part   = divmod(end_total_min - 1,    60)   # -1 → inclusive end minute
+
+    start_time = f"{file_date}T{start_hour:02d}:{start_min_part:02d}:00.000"
+    end_time   = f"{file_date}T{end_hour:02d}:{end_min_part:02d}:59.999"
+
+    print(f"Fetching interval {i + 1}/{total_intervals}: {start_time} to {end_time}")
+
+    # ── ADDED: search_after pagination ───────────────────────────────────────
+    # Elasticsearch returns at most 10 000 hits per request (the "size" cap).
+    # With 30-min windows a single call may silently truncate.
+    # search_after pages through all results using the last document's sort
+    # values as a cursor; it has no depth limit.
+    sort_after  = None
+    page        = 0
+    window_hits = 0
+
+    while True:
+        page += 1
+        body = {
+            "size": 10000,
+            "sort": [
+                {"@timestamp": {"order": "asc"}},
+                {"_id":        {"order": "asc"}},   # tie-break for a stable cursor
+            ],
+            "fields":  ["*"],
+            "_source": False,
+            "query": {
+                "bool": {
+                    "must": [
+                        {"range": {"@timestamp": {"gte": start_time, "lte": end_time}}},
+                        {"terms": {"Scope.keyword": all_scopes}},
+                    ]
+                }
+            },
+        }
+
+        if sort_after is not None:
+            body["search_after"] = sort_after          # advance cursor on page 2+
+
+        response = requests.post(
+            update_url,
+            headers=headers,
+            auth=HTTPBasicAuth(user, pwd),
+            json=body,
+            verify=False,
+            timeout=120,
+        )
+
+        if response.status_code != 200:
+            raise Exception(
+                f"API call failed for interval {start_time} : {end_time}, "
+                f"page {page}: {response.text[:200]}"
+            )
+
+        page_hits    = response.json().get("hits", {}).get("hits", [])
+        all_hits.extend(page_hits)
+        window_hits += len(page_hits)
+
+        if len(page_hits) < 10000:
+            break                                      # last page – no more records
+
+        sort_after = page_hits[-1]["sort"]             # move cursor forward
+    # ─────────────────────────────────────────────────────────────────────────
+
+    start_total_min = end_total_min                    # advance to next window
+
+print(f"{total_intervals} intervals fetched successfully, total records: {len(all_hits)}")
 
 # COMMAND ----------
+# Cell 9 – Flatten ES hits into a list of plain dicts  (image 5)
+
+import json
+from pyspark.sql import functions as F
+
+flattened_records = []
+for record in all_hits:
+    flat = {}
+    for key, value in record.get("fields", {}).items():
+        flat[key] = value[0] if isinstance(value, list) and len(value) > 0 else value
+    flattened_records.append(flat)
+
+# COMMAND ----------
+# Cell 10 – Create Spark DataFrame  (image 5)
+
+# (1) Spark jobs
+rdd = spark.sparkContext.parallelize([json.dumps(r) for r in flattened_records])
+df  = spark.read.option("mergeSchema", "true").json(rdd)
+print(f"total columns: {len(df.columns)}")
+
+# COMMAND ----------
+# Cell 20 – Master column list + align DataFrame  (images 6, 7, 8)
+
+from pyspark.sql import functions as F
+from pyspark.sql.types import StringType
 
 MASTER_COLUMNS = [
     "apiproxyname",
@@ -89,151 +206,55 @@ MASTER_COLUMNS = [
     "response_time",
     "target.received.end.timestamp",
     "target.sent.start.timestamp",
-    # add more columns as needed
+    "BackendContentType.keyword",
+    "BackendErrorMessage",
+    "BackendErrorMessage.keyword",
+    "ClientIP.keyword",
+    "Environment.name.keyword",
+    "Environment_name",
+    "GatewayErrorCode",
+    "GatewayErrorCode.keyword",
+    "GatewayErrorMessage",
+    "GatewayErrorMessage.keyword",
+    "host",
+    "host.keyword",
+    "@timestamp",
+    "Scope.keyword",
+    "req-journeyID.keyword",
+    "resp-responseCode.keyword",
+    "APIProxyType",
+    "APIProxyType.keyword",
+    "BackendComp",
+    "BackendComp.keyword",
+    "CriticalityFlag",
+    "CriticalityFlag.keyword",
+    "Environment_name.keyword",
+    "GatewayErrorCode",
+    "GatewayErrorMessage.keyword",
+    "GatewayMappedErrorMessage",
+    "GatewayMappedErrorMessage.keyword",
+    "Platform",
+    "Platform.keyword",
+    "RequestType",
+    "RequestType.keyword",
+    "Scope",
+    "StatusCode",
+    "StatusCode.keyword",
+    "apigee-developer-app-name.keyword",
+    "apigee-developer-app-name",
+    "apigee-antispoofcomp.name",
+    "apigee-antispoofcomp.name.keyword",
+    "@ProxyType",
+    "@ProxyType.keyword",
+    "elkRoutingStatusCode",
+    "elkGatewayErrorMessage",
+    "response_time",
 ]
 
-# COMMAND ----------
-
-# ── Helper: fetch ALL records for one time window using search_after pagination ──
-#
-# Elasticsearch returns at most `page_size` documents per request.
-# search_after uses the sort values of the last document to request the next page,
-# avoiding the 10,000-document deep-pagination limit of from+size.
-#
-# Sort order: @timestamp ASC + _id ASC ensures a stable, unique cursor.
-
-PAGE_SIZE = 10_000   # maximum Elasticsearch allows per request
-
-def fetch_all_hits_for_window(start_time: str, end_time: str, all_scopes: list) -> list:
-    """Return every ES hit between start_time and end_time across all scopes."""
-    hits       = []
-    sort_after = None          # None on first page; list of sort values on subsequent pages
-    page       = 0
-
-    while True:
-        page += 1
-        body = {
-            "size": PAGE_SIZE,
-            "sort": [
-                {"@timestamp": {"order": "asc"}},
-                {"_id":        {"order": "asc"}},   # tie-break for stable cursor
-            ],
-            "query": {
-                "bool": {
-                    "must": [
-                        {"range": {"@timestamp": {"gte": start_time, "lte": end_time}}},
-                        {"terms": {"Scope.keyword": all_scopes}},
-                    ]
-                }
-            },
-            "_source": False,
-            "fields": ["*"],
-        }
-
-        # Attach the cursor on pages 2+
-        if sort_after is not None:
-            body["search_after"] = sort_after
-
-        response = requests.post(
-            update_url,
-            headers=headers,
-            auth=HTTPBasicAuth(user, pwd),
-            json=body,
-            verify=False,
-            timeout=120,
-        )
-
-        if response.status_code != 200:
-            raise Exception(
-                f"API call failed [{response.status_code}] for window "
-                f"{start_time} → {end_time}, page {page}: {response.text[:300]}"
-            )
-
-        page_hits = response.json().get("hits", {}).get("hits", [])
-        hits.extend(page_hits)
-
-        # Stop when Elasticsearch returns fewer records than the page size
-        if len(page_hits) < PAGE_SIZE:
-            break
-
-        # Advance the cursor to the sort values of the last document
-        sort_after = page_hits[-1]["sort"]
-
-    return hits
-
-
-# COMMAND ----------
-
-# ── Main ingestion loop ──
-
-# Date to ingest (T-2 by default)
-file_date = (datetime.now(kolkata_tz).date() - timedelta(days=2)).strftime("%Y-%m-%d")
-
-# ─────────────────────────────────────────────
-#  CHANGE: interval_minute  15 → 30
-#  This halves the number of API calls (96 → 48 per journey)
-#  while the pagination helper above guarantees no records are missed.
-# ─────────────────────────────────────────────
-interval_minute  = 30
-total_intervals  = (24 * 60) // interval_minute   # = 48
-
-all_scopes = list(SCOPE_JOURNEY_MAP.keys())
-all_hits   = []
-
-print(f"Ingesting date : {file_date}")
-print(f"Interval       : {interval_minute} min  ({total_intervals} windows/day)")
-print(f"Journeys       : {all_scopes}\n")
-
-for i in range(total_intervals):
-    start_total_min = i * interval_minute
-    end_total_min   = start_total_min + interval_minute - 1   # inclusive end
-
-    start_hour, start_min_part = divmod(start_total_min, 60)
-    end_hour,   end_min_part   = divmod(end_total_min,   60)
-
-    start_time = f"{file_date}T{start_hour:02d}:{start_min_part:02d}:00.000"
-    end_time   = f"{file_date}T{end_hour:02d}:{end_min_part:02d}:59.999"
-
-    print(f"Fetching window {i+1:>2}/{total_intervals}: {start_time}  →  {end_time}", end="  ")
-
-    window_hits = fetch_all_hits_for_window(start_time, end_time, all_scopes)
-    all_hits.extend(window_hits)
-
-    print(f"| {len(window_hits):>7,} records  (running total: {len(all_hits):>10,})")
-
-print(f"\nAll {total_intervals} windows fetched.  Total records: {len(all_hits):,}")
-
-# COMMAND ----------
-
-# ── Flatten hits and build Spark DataFrame ──
-
-import json
-
-flattened_records = []
-for record in all_hits:
-    flat = {}
-    for key, value in record.get("fields", {}).items():
-        flat[key] = (
-            json.dumps(value, list) if isinstance(value, list) and len(value) > 0
-            else value[0]            if isinstance(value, list) and len(value) > 0
-            else value
-        )
-    flattened_records.append(flat)
-
-pdf = pd.DataFrame(flattened_records)
-print(f"Total columns: {len(pdf.columns)}")
-
-# Align to MASTER_COLUMNS schema (fill missing cols with None)
-existing_cols  = set(pdf.columns)
-aligned_pdf    = pdf.reindex(columns=MASTER_COLUMNS)   # keeps only master cols, fills missing with NaN
-
-df = spark.createDataFrame(aligned_pdf)
-df = spark.sparkContext.parallelize(flattened_records).toDF()
-
 existing_cols = set(df.columns)
-aligned_df = df.select(
+aligned_df    = df.select(
     [
-        F.col(f"`{c}`") if c in existing_cols else F.lit(None).cast(StringType()).alias(c)
+        F.col(f"`{c}`").alias(c) if c in existing_cols else F.lit(None).cast(StringType()).alias(c)
         for c in MASTER_COLUMNS
     ]
 )
@@ -244,51 +265,46 @@ missing = [c for c in MASTER_COLUMNS if c not in existing_cols]
 print(f"Null-filled ({len(missing)}): {missing}")
 
 # COMMAND ----------
-
-# (5) Spark jobs — write to ADLS
+# Cell 22 – Write one Parquet file per journey to ADLS  (images 9 & 10)
 
 job_results = []
 
-for scope_val, journey in SCOPE_JOURNEY_MAP.items():
+for scope_val, Journey in SCOPE_JOURNEY_MAP.items():
     print(f"\n{'='*60}")
-    print(f"scope={scope_val}   journey={journey}")
+    print(f"\nscope_val={scope_val}  Journey={Journey}")
 
+    # filter to this journey's records
     journey_df = aligned_df.filter(col("Scope.keyword") == scope_val)
-    count = journey_df.count()
+    count      = journey_df.count()
+    print(f"Records for this scope: {count}")
 
     if count == 0:
-        print(f"  No data for {journey}. Skipping.")
-        job_results.append({"journey": journey, "status": "no_data"})
+        print(f"No data for {Journey} on {file_date}. Skipping.")
+        job_results.append({"Journey": Journey, "status": "no_date"})
         continue
 
-    print(f"  Records for this scope: {count}")
-
-    # Look up ADLS path from metadata table
+    # lookup ADLS landing path from metadata table
     metadata_rows = spark.sql(f"""
-        select ADLS_Path from sindhu_db_prod.ddi_metadata_db.api_config_table
-        where Pipeline = 'APIGEE_Ingestion_Daily' and Journey = '{journey}'
+        select ADLS_Path
+        from   sindhu_db_prod.ddi_metadata_db.api_config_table
+        where  Pipeline = 'APIGEE_Ingestion_Daily'
+        and    Journey  = '{Journey}'
     """).collect()
 
     if not metadata_rows:
-        print(f"  No metadata found for {journey}. Skipping.")
-        job_results.append({"journey": journey, "status": "no_metadata"})
+        print(f"No metadata found for {Journey}. Skipping.")
+        job_results.append({"Journey": Journey, "status": "NO_metadata"})
         continue
 
-    api_metadata  = {row["GroupID"]: row.asDict() for row in metadata_rows}
+    # api_metadata  = {row["GroupID"]: row.asDict() for row in metadata_rows}
     adls_path_base = metadata_rows[0]["ADLS_Path"]
     adls_raw_path  = (
         f"abfss://rawddiprodvyaparaadlsstd.dfs.core.windows.net"
-        f"{adls_path_base}/landing/{file_date}/"
+        f"{adls_path_base}/landing/{batch_id}/"
     )
 
-    # Write parquet
-    journey_df_dated = journey_df.withColumn("file_date", lit(file_date))
-    journey_df_dated.write.mode("overwrite").parquet(adls_raw_path)
-
-    print(f"  Writing to: {adls_raw_path}")
-    print(f"  Write complete for {journey}.  records: {count}")
-    job_results.append({"journey": journey, "status": "SUCCESS", "records": count})
-
-print("\n\nIngestion summary:")
-for r in job_results:
-    print(f"  {r}")
+    # write to ADLS
+    journey_df.write.mode("overwrite").parquet(adls_raw_path)
+    print(f"Writing to: {adls_raw_path}")
+    print(f"Write complete for {Journey}. records: {count}")
+    job_results.append({"Journey": Journey, "status": "SUCCESS", "records": count})
