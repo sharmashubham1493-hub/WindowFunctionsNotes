@@ -19,7 +19,7 @@ def file_reader_function(file_type, path_to_read, file_config, table_id):
         # file_config['header_row'] (1-based) tells us which row holds the real
         # column headers.  Defaults to 2 for backward-compatibility (old files
         # had one junk metadata row at the top, so row 2 was the real header).
-        header_row = file_config.get('header_row', 2)  # 1-based row number
+        header_row = file_config.get('header_row', 8)  # 1-based row number
 
         if header_row <= 2:
             # Legacy path: read with Spark header=True (row 1 becomes column
