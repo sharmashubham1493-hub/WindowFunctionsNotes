@@ -16,25 +16,25 @@ def file_reader_function(file_type, path_to_read, file_config, table_id):
 
     elif file_type == 'xlsx':
         # xlsx files are pre-converted to CSV by ADF before landing in ADLS.
-        # file_config['header_row'] (1-based) tells us which row holds the real
-        # column headers.  Defaults to 2 for backward-compatibility (old files
-        # had one junk metadata row at the top, so row 2 was the real header).
-        header_row = file_config.get('header_row', 8)  # 1-based row number
+        # file_config['skipRows'] (1-based) is the row number that holds the
+        # real column headers; all rows before it are metadata and are discarded.
+        # Defaults to 2 for backward-compatibility (one junk row at the top).
+        skip_rows = int(file_config.get('skipRows', 2))  # 1-based header row
 
-        if header_row <= 2:
+        if skip_rows <= 2:
             # Legacy path: read with Spark header=True (row 1 becomes column
             # names), then promote the first data row (row 2) to be the header.
             df = spark.read.csv(path_to_read, header=True)
             cols = [v for v in df.first()]
             df = df.toDF(*cols)
         else:
-            # General path: header is deeper in the file (e.g. row 8 for MAPS
-            # SFTP files that have 7 rows of metadata before the column names).
+            # General path: header is deeper in the file (e.g. skipRows=8 for
+            # MAPS SFTP files that have 7 metadata rows before the column names).
             # Read without any header, zip with sequential indices, pluck the
             # header row, then keep only the rows that follow it.
             df_raw = spark.read.csv(path_to_read, header=False)
             indexed = df_raw.rdd.zipWithIndex()
-            hdr_index = header_row - 1  # convert to 0-based
+            hdr_index = skip_rows - 1  # convert to 0-based index
             header_values = indexed.filter(lambda x: x[1] == hdr_index).first()[0]
             cols = [
                 str(v) if v is not None else f"_c{i}"
